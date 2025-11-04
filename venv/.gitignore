@@ -1,4 +1,0 @@
-# Virtual environment
-venv/
-# ... other exclusions
-.env
