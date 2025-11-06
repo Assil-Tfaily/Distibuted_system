@@ -1,6 +1,61 @@
-version: '3.8'
+version: "3.8"
 
 services:
+  api:
+    build: .
+    ports:
+      - "8000-8002:8000"
+    environment:
+      - MONGODB_URI=mongodb://mongodb:27017
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - REDIS_URI=redis://redis:6379
+    depends_on:
+      - mongodb
+      - kafka
+      - redis
+    deploy:
+      replicas: 3
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Nginx Load Balancer
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf
+    depends_on:
+      - api
+    deploy:
+      replicas: 1
+
+  redis:
+    image: redis:alpine
+    ports:
+      - "6379:6379"
+
+  # Monitoring
+  prometheus:
+    image: prom/prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+
+  grafana:
+    image: grafana/grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    depends_on:
+      - prometheus
+
   mongodb:
     image: mongo:6.0
     container_name: scraper-mongodb

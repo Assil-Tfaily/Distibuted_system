@@ -68,7 +68,7 @@ class LastFMScraperBS:
             return []
 
     def get_tracks_from_genre(self, genre_url: str, pages: int = 1) -> List[Dict]:
-        """Get track links from the genre's Tracks section."""
+        """Get track links from the genre's Tracks section with improved extraction."""
         tracks = []
         seen = set()
 
@@ -99,46 +99,19 @@ class LastFMScraperBS:
                 response.raise_for_status()
                 soup = BeautifulSoup(response.content, "html.parser")
                 
-                # Multiple selectors for track links
-                track_selectors = [
-                    "a[href*='/_/']",
-                    "tr.chartlist-row a",
-                    ".chartlist-name a",
-                    ".track-list .track a"
-                ]
+                # IMPROVED: Better track detection with multiple strategies
+                track_data = self._extract_tracks_robustly(soup)
                 
-                for selector in track_selectors:
-                    anchor_elems = soup.select(selector)
-                    if anchor_elems:
-                        logger.info(f"Found {len(anchor_elems)} track candidates using selector: {selector}")
-                        break
-                else:
-                    anchor_elems = soup.find_all("a", href=re.compile(r"/_/"))
-                
-                for a in anchor_elems:
-                    try:
-                        href = a.get("href") or ""
-                        if "/_/" not in href:
-                            continue
-                        
-                        name = a.get_text(strip=True)
-                        name = re.sub(r"\s+", " ", name).strip()
-                        
-                        if not name or len(name) < 2:
-                            continue
-                        
-                        # Make URL absolute
-                        if href.startswith("/"):
-                            href = self.base_url + href
-                        
-                        if href not in seen:
-                            seen.add(href)
-                            tracks.append({"name": name, "url": href})
-                    except Exception:
-                        continue
+                for track in track_data:
+                    href = track.get("url")
+                    name = track.get("name")
+                    
+                    if href and href not in seen:
+                        seen.add(href)
+                        tracks.append({"name": name, "url": href})
                 
                 logger.info(f"Page {page}: {len(tracks)} unique tracks so far")
-                time.sleep(random.uniform(1, 2))  # Random delay
+                time.sleep(random.uniform(1, 2))
                 
             except Exception as e:
                 logger.exception(f"Error loading page {page}: {e}")
@@ -146,8 +119,111 @@ class LastFMScraperBS:
         
         return tracks
 
+    def _extract_tracks_robustly(self, soup: BeautifulSoup) -> List[Dict]:
+        """Multiple strategies to extract track information."""
+        tracks = []
+        
+        # Strategy 1: Look for track rows in charts
+        chart_selectors = [
+            "tr.chartlist-row",
+            ".chartlist-item",
+            ".tracklist-item",
+            "li.chartlist-row"
+        ]
+        
+        for selector in chart_selectors:
+            rows = soup.select(selector)
+            if rows:
+                logger.info(f"Found {len(rows)} track rows using selector: {selector}")
+                for row in rows:
+                    track_info = self._extract_from_track_row(row)
+                    if track_info:
+                        tracks.append(track_info)
+                break
+        
+        # Strategy 2: Direct anchor links as fallback
+        if not tracks:
+            anchor_selectors = [
+                "a[href*='/_/']",
+                ".chartlist-name a",
+                ".track-list .track a",
+                ".title a"
+            ]
+            
+            for selector in anchor_selectors:
+                anchors = soup.select(selector)
+                if anchors:
+                    logger.info(f"Found {len(anchors)} track anchors using selector: {selector}")
+                    for a in anchors:
+                        href = a.get("href", "")
+                        name = a.get_text(strip=True)
+                        
+                        if "/_/" in href and name:
+                            # Make URL absolute
+                            if href.startswith("/"):
+                                href = self.base_url + href
+                            tracks.append({"name": name, "url": href})
+                    break
+        
+        # Strategy 3: Generic fallback
+        if not tracks:
+            all_track_links = soup.find_all("a", href=re.compile(r"/_/"))
+            for link in all_track_links:
+                href = link.get("href", "")
+                name = link.get_text(strip=True)
+                
+                if href and name:
+                    if href.startswith("/"):
+                        href = self.base_url + href
+                    tracks.append({"name": name, "url": href})
+        
+        # Clean up track names
+        for track in tracks:
+            if track["name"]:
+                track["name"] = re.sub(r"\s+", " ", track["name"]).strip()
+        
+        return tracks
+
+    def _extract_from_track_row(self, row) -> Optional[Dict]:
+        """Extract track info from a track row element."""
+        try:
+            # Try to find track link and name
+            name_selectors = [
+                ".chartlist-name a",
+                ".track-name a",
+                "a.chartlist-track",
+                "td.chartlist-name a"
+            ]
+            
+            for selector in name_selectors:
+                name_elem = row.select_one(selector)
+                if name_elem:
+                    href = name_elem.get("href", "")
+                    name = name_elem.get_text(strip=True)
+                    
+                    if href and "/_/" in href and name:
+                        if href.startswith("/"):
+                            href = self.base_url + href
+                        return {"name": name, "url": href}
+            
+            # Fallback: find any track link in the row
+            track_link = row.find("a", href=re.compile(r"/_/"))
+            if track_link:
+                href = track_link.get("href", "")
+                name = track_link.get_text(strip=True)
+                
+                if href and name:
+                    if href.startswith("/"):
+                        href = self.base_url + href
+                    return {"name": name, "url": href}
+        
+        except Exception as e:
+            logger.debug(f"Error extracting from track row: {e}")
+        
+        return None
+
     def extract_track_details(self, track_url: str, genre_name: str) -> Dict:
-        """Extract detailed info about a track with robust error handling."""
+        """Extract detailed info about a track with improved selectors."""
         logger.info(f"Extracting details from {track_url}")
         
         data = {
@@ -166,7 +242,6 @@ class LastFMScraperBS:
         try:
             response = self.session.get(track_url, timeout=15)
             
-            # Handle 502 and other errors gracefully
             if response.status_code == 502:
                 data["scraping_status"] = "502_error"
                 logger.warning(f"502 Bad Gateway for {track_url}")
@@ -179,42 +254,25 @@ class LastFMScraperBS:
             response.raise_for_status()
             soup = BeautifulSoup(response.content, "html.parser")
             
-            # Store raw HTML (limited length to avoid huge files)
-            data["raw_html"] = str(soup)[:5000]  # First 5000 chars
+            # Store raw HTML (limited length)
+            data["raw_html"] = str(soup)[:5000]
             
-            # Track name - multiple selectors
-            track_name_selectors = [
-                "h1.header-new-title",
-                "h1.track-header-title",
-                "h1",
-                ".track-header h1"
-            ]
+            # IMPROVED: Extract track name with better selectors
+            track_name = self._extract_track_name(soup)
+            if track_name:
+                data["track_name"] = track_name
             
-            for selector in track_name_selectors:
-                elem = soup.select_one(selector)
-                if elem and elem.get_text(strip=True):
-                    data["track_name"] = elem.get_text(strip=True)
-                    break
+            # IMPROVED: Extract artist name with better selectors
+            artist_name = self._extract_artist_name(soup)
+            if artist_name:
+                data["artist_name"] = artist_name
             
-            # Artist name - multiple selectors
-            artist_selectors = [
-                'span[itemprop="byArtist"] [itemprop="name"]',
-                "h2 a",
-                ".artist-name a",
-                ".header-new-description a"
-            ]
-            
-            for selector in artist_selectors:
-                elem = soup.select_one(selector)
-                if elem and elem.get_text(strip=True):
-                    data["artist_name"] = elem.get_text(strip=True)
-                    break
-            
-            # Album - multiple selectors
+            # Album
             album_selectors = [
                 "h4.source-album-name a",
                 ".album-name a",
-                ".track-album a"
+                ".track-album a",
+                ".album-link"
             ]
             
             for selector in album_selectors:
@@ -238,24 +296,7 @@ class LastFMScraperBS:
                     break
             
             # Listeners and Playcount
-            stats_selectors = [
-                "abbr[title]",
-                ".chart-details .chart-count",
-                ".track-stats .stat"
-            ]
-            
-            stats_values = []
-            for selector in stats_selectors:
-                elems = soup.select(selector)
-                for elem in elems:
-                    title = elem.get("title", "").strip()
-                    if title and re.match(r"^[\d,]+$", title.replace(" ", "").replace(",", "")):
-                        stats_values.append(title)
-                    # Also check text content
-                    text = elem.get_text(strip=True)
-                    if text and re.match(r"^[\d,]+$", text.replace(" ", "").replace(",", "")):
-                        stats_values.append(text)
-            
+            stats_values = self._extract_stats(soup)
             if len(stats_values) >= 1:
                 data["listeners"] = stats_values[0]
             if len(stats_values) >= 2:
@@ -266,7 +307,7 @@ class LastFMScraperBS:
                 logger.info(f"Successfully extracted: {data['track_name']} - {data['artist_name']}")
             else:
                 data["scraping_status"] = "partial_data"
-                logger.warning(f"Partial data for {track_url}")
+                logger.warning(f"Partial data for {track_url}. Track: {data['track_name']}, Artist: {data['artist_name']}")
             
         except requests.exceptions.RequestException as e:
             data["scraping_status"] = "request_error"
@@ -278,6 +319,73 @@ class LastFMScraperBS:
             self.failed_urls.append(track_url)
         
         return data
+
+    def _extract_track_name(self, soup: BeautifulSoup) -> str:
+        """Extract track name with multiple strategies."""
+        track_selectors = [
+            "h1.header-new-title",
+            "h1.track-header-title",
+            "h1",
+            ".track-header h1",
+            ".track-top-info h1",
+            "[itemprop='name']",
+            "h1.js-track-name"
+        ]
+        
+        for selector in track_selectors:
+            elem = soup.select_one(selector)
+            if elem and elem.get_text(strip=True):
+                text = elem.get_text(strip=True)
+                # Clean up the text (remove "Lyrics" suffix, etc.)
+                text = re.sub(r'\s+Lyrics$', '', text, flags=re.IGNORECASE)
+                return text
+        
+        return ""
+
+    def _extract_artist_name(self, soup: BeautifulSoup) -> str:
+        """Extract artist name with multiple strategies."""
+        artist_selectors = [
+            'span[itemprop="byArtist"] [itemprop="name"]',
+            "h2 a",
+            ".artist-name a",
+            ".header-new-description a",
+            ".track-artist a",
+            "[itemprop='byArtist'] [itemprop='name']",
+            ".track-top-info .artist"
+        ]
+        
+        for selector in artist_selectors:
+            elem = soup.select_one(selector)
+            if elem and elem.get_text(strip=True):
+                return elem.get_text(strip=True)
+        
+        return ""
+
+    def _extract_stats(self, soup: BeautifulSoup) -> List[str]:
+        """Extract listeners and playcount statistics."""
+        stats_selectors = [
+            "abbr[title]",
+            ".chart-details .chart-count",
+            ".track-stats .stat",
+            ".metadata-list .metadata-item",
+            ".sidebar-section .stats"
+        ]
+        
+        stats_values = []
+        for selector in stats_selectors:
+            elems = soup.select(selector)
+            for elem in elems:
+                # Check title attribute first
+                title = elem.get("title", "").strip()
+                if title and re.match(r"^[\d,]+$", title.replace(" ", "").replace(",", "")):
+                    stats_values.append(title)
+                
+                # Check text content
+                text = elem.get_text(strip=True)
+                if text and re.match(r"^[\d,]+$", text.replace(" ", "").replace(",", "")):
+                    stats_values.append(text)
+        
+        return stats_values
 
     def save_to_csv(self, data: List[Dict]):
         if not data:
@@ -292,6 +400,7 @@ class LastFMScraperBS:
             writer.writerows(data)
         
         logger.info(f"Saved {len(data)} rows to {self.output_csv}")
+
     def run(self, genre_names: List[str] = None, max_tracks_per_genre=None, pages: int = 1):
         """Run the scraper with improved error handling."""
         all_tracks = []
@@ -324,7 +433,6 @@ class LastFMScraperBS:
                         if (i + 1) % 10 == 0:
                             logger.info(f"Progress in {g['name']}: {i+1}/{len(tracks)}")
                         
-                        # Variable delay with jitter
                         time.sleep(random.uniform(0.5, 1.5))
                         
                     except Exception as e:
@@ -341,13 +449,12 @@ class LastFMScraperBS:
             logger.info("Scraping completed!")
 
 
-# Simple test function
 def test_scraper():
     """Test the scraper with a small sample."""
     scraper = LastFMScraperBS(output_csv="test_scraping_results.csv")
     scraper.run(
-        genre_names=["Rock", "Jazz"],  # Just 2 genres for testing
-        max_tracks_per_genre=5,        # Just 5 tracks per genre
+        genre_names=["Rock", "Jazz"],
+        max_tracks_per_genre=5,
         pages=1
     )
 

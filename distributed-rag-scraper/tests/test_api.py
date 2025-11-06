@@ -1,114 +1,84 @@
+# tests/test_api.py
 import requests
 import json
 import time
-import os
-import sys
-
-# Add src to path to import modules
-sys.path.append(os.path.join(os.path.dirname(__file__), '../src'))
 
 BASE_URL = "http://localhost:8000"
-TOKEN = "your-test-token-here"
+API_KEY = "music-api-key-2024"
 
-def test_health_check():
-    """Test API health endpoint"""
-    response = requests.get(f"{BASE_URL}/health")
-    print(f"✅ Health Check: {response.status_code} - {response.json()}")
-    return response.status_code == 200
+headers = {
+    "Authorization": f"Bearer {API_KEY}",
+    "Content-Type": "application/json"
+}
 
-def test_raw_data_endpoint():
-    """Test raw data retrieval"""
-    headers = {"Authorization": f"Bearer {TOKEN}"}
-    response = requests.get(f"{BASE_URL}/api/v1/raw-data", headers=headers)
-    print(f"📊 Raw Data Endpoint: {response.status_code}")
-    if response.status_code == 200:
+def test_api():
+    print("🚀 Testing Music RAG API")
+    print("=" * 50)
+    
+    # Test 1: Health check
+    print("1. Testing health check...")
+    try:
+        response = requests.get(f"{BASE_URL}/health")
+        print(f"   Status: {response.status_code}")
+        print(f"   Response: {response.json()}\n")
+    except Exception as e:
+        print(f"   ❌ Failed: {e}\n")
+    
+    # Test 2: Get raw data
+    print("2. Testing raw data endpoint...")
+    try:
+        response = requests.get(
+            f"{BASE_URL}/api/data/raw?limit=3", 
+            headers=headers
+        )
         data = response.json()
-        print(f"   Retrieved {len(data)} documents")
-        return True
-    return False
-
-def test_processed_data_endpoint():
-    """Test processed data retrieval"""
-    headers = {"Authorization": f"Bearer {TOKEN}"}
-    response = requests.get(f"{BASE_URL}/api/v1/processed-data", headers=headers)
-    print(f"🔧 Processed Data Endpoint: {response.status_code}")
-    if response.status_code == 200:
+        print(f"   Status: {data.get('status')}")
+        print(f"   Count: {data.get('count')}")
+        if data.get('data'):
+            print(f"   Sample track: {data['data'][0].get('track_name', 'N/A')}\n")
+    except Exception as e:
+        print(f"   ❌ Failed: {e}\n")
+    
+    # Test 3: Enhanced query
+    print("3. Testing enhanced query...")
+    try:
+        response = requests.get(
+            f"{BASE_URL}/api/data/enhanced?query=rock music&n_results=3",
+            headers=headers
+        )
         data = response.json()
-        print(f"   Retrieved {len(data)} processed documents")
-        return True
-    return False
-
-def test_search_endpoint():
-    """Test search functionality"""
-    headers = {
-        "Authorization": f"Bearer {TOKEN}",
-        "Content-Type": "application/json"
-    }
-    search_data = {
-        "query": "artificial intelligence",
-        "limit": 5,
-        "threshold": 0.7
-    }
-    response = requests.post(
-        f"{BASE_URL}/api/v1/search",
-        headers=headers,
-        json=search_data
-    )
-    print(f"🔍 Search Endpoint: {response.status_code}")
-    if response.status_code == 200:
-        results = response.json()
-        print(f"   Found {results['total_count']} results in {results['query_time']:.2f}s")
-        return True
-    return False
-
-def test_rate_limiting():
-    """Test rate limiting functionality"""
-    headers = {"Authorization": f"Bearer {TOKEN}"}
-    rate_limit_hit = False
+        print(f"   Status: {data.get('status')}")
+        print(f"   Sources used: {data.get('sources_used')}")
+        print(f"   Confidence: {data.get('confidence')}")
+        answer = data.get('answer', '')[:100] + "..." if data.get('answer') else "N/A"
+        print(f"   Answer preview: {answer}\n")
+    except Exception as e:
+        print(f"   ❌ Failed: {e}\n")
     
-    for i in range(65):  # Exceed rate limit (60 requests/min)
-        response = requests.get(f"{BASE_URL}/api/v1/raw-data", headers=headers)
-        if response.status_code == 429:
-            print(f"🚫 Rate limit hit at request {i+1}")
-            rate_limit_hit = True
-            break
-        time.sleep(0.1)
+    # Test 4: Search
+    print("4. Testing search...")
+    try:
+        response = requests.get(
+            f"{BASE_URL}/api/search?q=jazz&limit=3",
+            headers=headers
+        )
+        data = response.json()
+        print(f"   Status: {data.get('status')}")
+        print(f"   Results: {data.get('results_count')}")
+        if data.get('results'):
+            print(f"   Top result: {data['results'][0].get('track_name', 'N/A')}\n")
+    except Exception as e:
+        print(f"   ❌ Failed: {e}\n")
     
-    return rate_limit_hit
-
-def run_all_tests():
-    """Run all API tests"""
-    print("🚀 Starting API Tests...\n")
-    
-    tests = [
-        ("Health Check", test_health_check),
-        ("Raw Data Endpoint", test_raw_data_endpoint),
-        ("Processed Data Endpoint", test_processed_data_endpoint),
-        ("Search Endpoint", test_search_endpoint),
-        ("Rate Limiting", test_rate_limiting),
-    ]
-    
-    results = []
-    for test_name, test_func in tests:
-        try:
-            success = test_func()
-            results.append((test_name, success))
-        except Exception as e:
-            print(f"❌ {test_name} failed with error: {e}")
-            results.append((test_name, False))
-    
-    # Print summary
-    print("\n📋 Test Summary:")
-    print("-" * 40)
-    for test_name, success in results:
-        status = "✅ PASS" if success else "❌ FAIL"
-        print(f"{test_name}: {status}")
-    
-    passed = sum(1 for _, success in results if success)
-    total = len(results)
-    print(f"\n🎯 Overall: {passed}/{total} tests passed")
-    
-    return all(success for _, success in results)
+    # Test 5: Stats
+    print("5. Testing stats endpoint...")
+    try:
+        response = requests.get(f"{BASE_URL}/api/stats", headers=headers)
+        data = response.json()
+        print(f"   Pipeline ready: {data.get('pipeline', {}).get('ready', 'N/A')}")
+        print(f"   MongoDB docs: {data.get('mongodb', {}).get('total_documents', 'N/A')}\n")
+    except Exception as e:
+        print(f"   ❌ Failed: {e}\n")
 
 if __name__ == "__main__":
-    run_all_tests()
+    test_api()

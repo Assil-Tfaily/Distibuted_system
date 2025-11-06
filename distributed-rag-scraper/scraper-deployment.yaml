@@ -1,0 +1,23 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: scraper-worker
+spec:
+  replicas: 2 # Multiple scraper instances
+  selector:
+    matchLabels:
+      app: scraper-worker
+  template:
+    metadata:
+      labels:
+        app: scraper-worker
+    spec:
+      containers:
+        - name: scraper-worker
+          image: your-username/scraper-worker:latest
+          env:
+            - name: KAFKA_BOOTSTRAP_SERVERS
+              value: "localhost:9092"
+            - name: MONGODB_URI
+              value: "mongodb://localhost:27017/rag_scraper"
+          # Auto-restart is built into Kubernetes - it will restart failed containers

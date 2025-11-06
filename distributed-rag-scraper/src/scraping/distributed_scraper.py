@@ -2,15 +2,48 @@ from dask.distributed import Client, LocalCluster
 import time
 from typing import List, Dict
 from .base_scraper import LastFMScraperBS
-from .url_manager import KafkaScraperCoordinator
+from .url_manager import KafkaURLManager
 import logging
 import csv
 
 logger = logging.getLogger(__name__)
 
+def kafka_worker_process(url_batch: List[Dict]) -> List[Dict]:
+    """Dask worker function that processes URLs from Kafka."""
+    scraper = LastFMScraperBS()
+    results = []
+    
+    for url_data in url_batch:
+        try:
+            details = scraper.extract_track_details(
+                url_data['url'], 
+                url_data['genre']
+            )
+            results.append(details)
+            time.sleep(0.5)  # Rate limiting
+            logger.info(f"Processed: {details.get('track_name')}")
+        except Exception as e:
+            logger.error(f"Failed to process URL {url_data['url']}: {e}")
+            # Create error record
+            error_data = {
+                "genre": url_data.get('genre', 'Unknown'),
+                "track_url": url_data.get('url', 'Unknown'),
+                "track_name": url_data.get('track_name', 'Unknown'),
+                "artist_name": "N/A",
+                "album": "N/A", 
+                "duration": "N/A",
+                "listeners": "N/A",
+                "playcount": "N/A",
+                "raw_html": "N/A",
+                "scraping_status": f"error: {str(e)}"
+            }
+            results.append(error_data)
+    
+    return results
+
 def scrape_genre_worker(genre_data: Dict, max_tracks: int = 50, pages: int = 2) -> List[Dict]:
-    """Worker function to scrape a single genre."""
-    worker_id = id(genre_data) % 1000  # Simple worker ID
+    """Traditional Dask worker function (without Kafka)."""
+    worker_id = id(genre_data) % 1000
     scraper = LastFMScraperBS()
     
     logger.info(f"Worker {worker_id} scraping genre: {genre_data['name']}")
@@ -25,7 +58,7 @@ def scrape_genre_worker(genre_data: Dict, max_tracks: int = 50, pages: int = 2) 
             try:
                 details = scraper.extract_track_details(track["url"], genre_data["name"])
                 results.append(details)
-                time.sleep(0.5)  # Rate limiting
+                time.sleep(0.5)
             except Exception as e:
                 logger.error(f"Worker {worker_id} failed to extract track: {e}")
                 continue
@@ -37,35 +70,84 @@ def scrape_genre_worker(genre_data: Dict, max_tracks: int = 50, pages: int = 2) 
         return []
 
 class DistributedScraper:
-    def __init__(self, n_workers: int = 4, use_kafka: bool = False):
+    def __init__(self, n_workers: int = 4):
         self.n_workers = n_workers
-        self.use_kafka = use_kafka
-        
-        if use_kafka:
-            self.kafka_coordinator = KafkaScraperCoordinator()
-            logger.info("Initialized with Kafka URL management")
-        else:
-            self.cluster = LocalCluster(n_workers=n_workers, threads_per_worker=1)
-            self.client = Client(self.cluster)
-            logger.info(f"Initialized Dask cluster with {n_workers} workers")
+        self.cluster = LocalCluster(n_workers=n_workers, threads_per_worker=1)
+        self.client = Client(self.cluster)
+        self.kafka_manager = KafkaURLManager()
+        logger.info(f"Initialized Dask cluster with {n_workers} workers")
 
-    def scrape_genres(self, genre_names: List[str] = None, max_tracks_per_genre: int = 50, pages: int = 2) -> List[Dict]:
-        """Distribute scraping tasks across Dask workers."""
+    def scrape_genres_kafka(self, genre_names: List[str] = None, max_tracks_per_genre: int = 50, pages: int = 2) -> List[Dict]:
+        """Distributed scraping using Kafka for URL management and Dask for processing."""
         base_scraper = LastFMScraperBS()
         all_genres = base_scraper.get_genres()
         
         if genre_names:
             all_genres = [g for g in all_genres if g["name"].lower() in [x.lower() for x in genre_names]]
         
-        logger.info(f"Distributing {len(all_genres)} genres across {self.n_workers} workers")
-        if self.use_kafka:
-            return self._scrape_with_kafka(all_genres, max_tracks_per_genre, pages)
-        else:
-            return self._scrape_with_dask(all_genres, max_tracks_per_genre, pages)
+        logger.info(f"Generating URLs for {len(all_genres)} genres")
         
-        # Submit tasks to Dask
-    def _scrape_with_dask(self, all_genres: List[Dict], max_tracks_per_genre: int, pages: int) -> List[Dict]:
-        """Use Dask for distributed scraping."""
+        # Generate all URLs and push to Kafka
+        all_urls = []
+        for genre in all_genres:
+            tracks = base_scraper.get_tracks_from_genre(genre['url'], pages=pages)
+            if max_tracks_per_genre:
+                tracks = tracks[:max_tracks_per_genre]
+            
+            for track in tracks:
+                url_data = {
+                    'url': track['url'],
+                    'genre': genre['name'],
+                    'track_name': track['name'],
+                    'type': 'track_details'
+                }
+                all_urls.append(url_data)
+        
+        # Submit all URLs to Kafka
+        total_urls = self.kafka_manager.submit_urls(all_urls)
+        logger.info(f"Submitted {total_urls} URLs to Kafka topic")
+        
+        # Process URLs from Kafka using Dask workers
+        all_results = []
+        processed_urls = 0
+        batch_size = 5  # URLs per batch per worker
+        
+        while processed_urls < total_urls:
+            # Get URL batch from Kafka
+            url_batch = self.kafka_manager.get_url_batch('scraping-urls', batch_size=batch_size)
+            
+            if not url_batch:
+                logger.info("No more URLs to process")
+                break
+            
+            # Submit batch to Dask workers
+            futures = []
+            for i in range(0, len(url_batch), batch_size):
+                batch = url_batch[i:i + batch_size]
+                future = self.client.submit(kafka_worker_process, batch)
+                futures.append(future)
+            
+            # Collect results
+            for future in futures:
+                try:
+                    batch_results = future.result(timeout=300)
+                    all_results.extend(batch_results)
+                    processed_urls += len(batch_results)
+                    logger.info(f"Progress: {processed_urls}/{total_urls} URLs processed")
+                except Exception as e:
+                    logger.error(f"Error processing batch: {e}")
+        
+        logger.info(f"Kafka+Dask scraping completed. Total tracks: {len(all_results)}")
+        return all_results
+
+    def scrape_genres_dask(self, genre_names: List[str] = None, max_tracks_per_genre: int = 50, pages: int = 2) -> List[Dict]:
+        """Traditional Dask distributed scraping without Kafka."""
+        base_scraper = LastFMScraperBS()
+        all_genres = base_scraper.get_genres()
+        
+        if genre_names:
+            all_genres = [g for g in all_genres if g["name"].lower() in [x.lower() for x in genre_names]]
+        
         logger.info(f"Distributing {len(all_genres)} genres across {self.n_workers} Dask workers")
         
         futures = []
@@ -78,74 +160,21 @@ class DistributedScraper:
             )
             futures.append(future)
         
-        # Collect results
         all_results = []
         completed = 0
         for future in futures:
             try:
-                result = future.result(timeout=300)  # 5 minute timeout
+                result = future.result(timeout=300)
                 all_results.extend(result)
                 completed += 1
                 logger.info(f"Progress: {completed}/{len(all_genres)} genres completed")
             except Exception as e:
                 logger.error(f"Error getting result from worker: {e}")
         
-        logger.info(f"Scraping completed. Total tracks: {len(all_results)}")
+        logger.info(f"Dask scraping completed. Total tracks: {len(all_results)}")
         return all_results
-    
-    def _scrape_with_kafka(self, all_genres: List[Dict], max_tracks_per_genre: int, pages: int) -> List[Dict]:
-        """Use Kafka for URL management and distributed scraping."""
-        from kafka import KafkaConsumer
-        import json
-        
-        logger.info("Starting Kafka-based distributed scraping")
-        
-        # Generate and submit URLs to Kafka
-        total_urls = self.kafka_coordinator.generate_urls_from_genres(all_genres, pages)
-        logger.info(f"Generated {total_urls} URLs in Kafka topic")
-        
-        # Start multiple workers to process URLs
-        results = []
-        results_consumer = KafkaConsumer(
-            'scraping-results',
-            bootstrap_servers=['localhost:9092'],
-            auto_offset_reset='earliest',
-            value_deserializer=lambda x: json.loads(x.decode('utf-8'))
-        )
-        
-        # For demo purposes, we'll process URLs directly
-        # In production, you'd have separate worker processes
-        consumer = KafkaConsumer(
-            'scraping-urls',
-            bootstrap_servers=['localhost:9092'],
-            auto_offset_reset='earliest',
-            group_id='demo-scraper-group',
-            value_deserializer=lambda x: json.loads(x.decode('utf-8'))
-        )
-        
-        logger.info("Starting to process URLs from Kafka...")
-        processed = 0
-        
-        for message in consumer:
-            if processed >= total_urls:
-                break
-                
-            url_data = message.value
-            try:
-                result = self.kafka_coordinator.process_url_message(url_data)
-                processed += 1
-                logger.info(f"Processed {processed}/{total_urls} URLs")
-            except Exception as e:
-                logger.error(f"Failed to process URL: {e}")
-        
-        consumer.close()
-        results_consumer.close()
-        
-        # For this demo, return empty list since results go to Kafka topics
-        # In real implementation, you'd collect from scraping-results topic
-        return []
 
-    def save_results(self, results: List[Dict], filename: str = "dask_scraping_results.csv"):
+    def save_results(self, results: List[Dict], filename: str = "distributed_scraping_results.csv"):
         """Save results to CSV."""
         if not results:
             logger.info("No results to save")
@@ -159,10 +188,6 @@ class DistributedScraper:
         logger.info(f"Saved {len(results)} tracks to {filename}")
 
     def close(self):
-        """Close resources."""
-        if hasattr(self, 'client'):
-            self.client.close()
-        if hasattr(self, 'cluster'):
-            self.cluster.close()
-        if hasattr(self, 'kafka_coordinator'):
-            self.kafka_coordinator.url_manager.stop_consumer()
+        """Close Dask client and cluster."""
+        self.client.close()
+        self.cluster.close()
